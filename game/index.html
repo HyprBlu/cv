@@ -1,0 +1,761 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#9fb4c7">
+<title>Third Person Greybox</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; overflow: hidden; background: #9fb4c7;
+    touch-action: none; user-select: none; -webkit-user-select: none;
+    -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  canvas { display: block; }
+
+  /* Full-screen input layer: left half = joystick, right half = camera */
+  #touch { position: fixed; inset: 0; z-index: 1; touch-action: none; }
+
+  #joy-base {
+    position: fixed; z-index: 2; pointer-events: none;
+    width: 130px; height: 130px; margin: -65px 0 0 -65px; border-radius: 50%;
+    background: rgba(255,255,255,0.12); border: 2px solid rgba(255,255,255,0.45);
+    box-shadow: 0 2px 12px rgba(0,0,0,0.15);
+    opacity: 0.55; transition: opacity 0.15s;
+  }
+  #joy-base.active { opacity: 1; transition: none; }
+  #joy-knob {
+    position: absolute; left: 50%; top: 50%; width: 58px; height: 58px; margin: -29px 0 0 -29px;
+    border-radius: 50%; background: rgba(255,255,255,0.85); box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+  }
+
+  .btn {
+    position: fixed; z-index: 3; touch-action: none;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 50%; color: #233; font-weight: 700; letter-spacing: 0.04em;
+    background: rgba(255,255,255,0.75); border: 2px solid rgba(255,255,255,0.9);
+    box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+  }
+  .btn.pressed { background: rgba(255,170,60,0.95); transform: scale(0.94); }
+  #jump {
+    width: 84px; height: 84px; font-size: 15px;
+    right: calc(28px + env(safe-area-inset-right)); bottom: calc(36px + env(safe-area-inset-bottom));
+  }
+  .small {
+    width: 40px; height: 40px; font-size: 16px; top: calc(12px + env(safe-area-inset-top));
+    background: rgba(255,255,255,0.55);
+  }
+  #reset { right: calc(12px + env(safe-area-inset-right)); }
+  #fs { right: calc(60px + env(safe-area-inset-right)); }
+
+  #hud {
+    position: fixed; z-index: 2; pointer-events: none;
+    left: calc(12px + env(safe-area-inset-left)); top: calc(12px + env(safe-area-inset-top));
+    color: #fff; font: 12px/1.4 ui-monospace, Menlo, monospace; text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+  }
+  #hint {
+    position: fixed; z-index: 2; pointer-events: none; left: 50%; top: 22%;
+    transform: translateX(-50%); padding: 10px 16px; border-radius: 10px; text-align: center;
+    background: rgba(20,30,40,0.6); color: #fff; font-size: 14px; line-height: 1.5;
+    transition: opacity 0.6s; white-space: nowrap;
+  }
+  #hint.hidden { opacity: 0; }
+  #split {
+    position: fixed; z-index: 1; pointer-events: none; left: 50%; top: 0; bottom: 0; width: 0;
+    border-left: 2px dashed rgba(255,255,255,0.35); transition: opacity 0.6s;
+  }
+  #split.hidden { opacity: 0; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="touch"></div>
+<div id="split"></div>
+<div id="joy-base"><div id="joy-knob"></div></div>
+<div id="jump" class="btn">JUMP</div>
+<div id="reset" class="btn small" title="Respawn">&#8635;</div>
+<div id="fs" class="btn small" title="Fullscreen">&#x26F6;</div>
+<div id="hud"></div>
+<div id="hint">Left side: move &nbsp;·&nbsp; Right side: look<br><small>Desktop: WASD + Space, drag to look</small></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { Octree } from 'three/addons/math/Octree.js';
+import { Capsule } from 'three/addons/math/Capsule.js';
+
+/* ============================================================
+   CONFIG — tweak these to change the feel
+   ============================================================ */
+const CFG = {
+  // Player
+  radius: 0.35,
+  height: 1.8,
+  maxSpeed: 6.5,          // m/s at full joystick deflection
+  groundAccel: 14,        // how quickly we reach target speed on ground
+  airAccel: 3,            // air control
+  gravity: 25,
+  jumpHeight: 1.3,        // metres
+  coyoteTime: 0.1,        // can still jump this long after leaving a ledge
+  jumpBuffer: 0.12,       // jump pressed slightly before landing still counts
+  maxSlopeDeg: 50,        // steeper than this = wall
+  groundSnap: 0.35,       // keeps us glued to ramps / stairs going down
+  turnSpeed: 12,          // character rotation smoothing
+  substeps: 5,
+
+  // Camera
+  camDistance: 5,
+  camMinDistance: 0.8,
+  camHeight: 1.45,        // look-at point above feet
+  lookSensitivity: 0.0055,// radians per pixel dragged
+  pitchMin: -0.55,
+  pitchMax: 1.25,
+  camFollow: 14,          // target smoothing (higher = snappier)
+
+  // Joystick
+  joyRadius: 52,          // px of knob travel
+  joyDeadzone: 0.12,
+};
+
+/* ============================================================
+   RENDERER / SCENE
+   ============================================================ */
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+const SKY = new THREE.Color(0x9fb4c7);
+scene.background = SKY;
+scene.fog = new THREE.Fog(SKY, 45, 120);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 300);
+
+scene.add(new THREE.HemisphereLight(0xdfeaf5, 0x5a5550, 1.1));
+const sun = new THREE.DirectionalLight(0xffffff, 2.2);
+sun.position.set(18, 30, 12);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+const S = 28;
+Object.assign(sun.shadow.camera, { left: -S, right: S, top: S, bottom: -S, near: 1, far: 90 });
+sun.shadow.bias = -0.0005;
+sun.shadow.normalBias = 0.03;
+scene.add(sun, sun.target);
+const SUN_OFFSET = sun.position.clone();
+
+/* ============================================================
+   GREYBOX MATERIAL — world-space grid lines (1m minor, 5m major)
+   so every surface reads scale regardless of the object's size.
+   ============================================================ */
+function gridMaterial(color) {
+  const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.9, metalness: 0 });
+  mat.onBeforeCompile = (shader) => {
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nvarying vec3 vGridPos;\nvarying vec3 vGridNormal;')
+      .replace('#include <worldpos_vertex>', `#include <worldpos_vertex>
+        vGridPos = (modelMatrix * vec4(transformed, 1.0)).xyz;
+        vGridNormal = normalize(mat3(modelMatrix) * objectNormal);`);
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>
+        varying vec3 vGridPos;
+        varying vec3 vGridNormal;
+        float gridLine(vec2 p, float width) {
+          vec2 g = abs(fract(p - 0.5) - 0.5) / fwidth(p);
+          return 1.0 - clamp(min(g.x, g.y) / width, 0.0, 1.0);
+        }`)
+      .replace('#include <map_fragment>', `#include <map_fragment>
+        {
+          vec3 an = abs(vGridNormal);
+          vec2 uv = (an.y >= an.x && an.y >= an.z) ? vGridPos.xz
+                  : (an.x >= an.z ? vGridPos.zy : vGridPos.xy);
+          float minor = gridLine(uv, 1.0);
+          float major = gridLine(uv / 5.0, 1.6);
+          vec2 cell = floor(uv);
+          float checker = mod(cell.x + cell.y, 2.0);
+          diffuseColor.rgb *= 1.0 - checker * 0.035;
+          diffuseColor.rgb *= 1.0 - minor * 0.18;
+          diffuseColor.rgb *= 1.0 - major * 0.3;
+        }`);
+  };
+  return mat;
+}
+
+const MAT = {
+  floor:  gridMaterial(0x6d7278),
+  wall:   gridMaterial(0xb9bdc2),
+  block:  gridMaterial(0x9aa0a6),
+  accent: gridMaterial(0xe8913a),
+  blue:   gridMaterial(0x5b8fd6),
+  green:  gridMaterial(0x6fb46a),
+};
+
+/* ============================================================
+   TEST WORLD
+   `world`  -> rendered AND collidable (goes into the octree)
+   `decor`  -> rendered only (labels, stair visuals)
+   colliders with visible=false -> collidable only
+   ============================================================ */
+const world = new THREE.Group();
+const decor = new THREE.Group();
+scene.add(world, decor);
+
+function box(w, h, d, x, y, z, mat = MAT.block, parent = world) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+  m.position.set(x, y + h / 2, z);   // y = bottom of the box
+  m.castShadow = m.receiveShadow = true;
+  parent.add(m);
+  return m;
+}
+
+// Wedge rising along -Z from height 0 at z=0 to height h at z=-l (local space)
+function wedgeGeometry(w, h, l) {
+  const x = w / 2;
+  const A = [-x, 0, 0], B = [x, 0, 0], C = [-x, 0, -l], D = [x, 0, -l], E = [-x, h, -l], F = [x, h, -l];
+  const tris = [A,C,D, A,D,B,  C,E,F, C,F,D,  A,B,F, A,F,E,  A,E,C,  B,D,F];
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(tris.flat(), 3));
+  g.computeVertexNormals();
+  return g;
+}
+function ramp(w, h, l, x, y, z, rotY = 0, mat = MAT.accent, parent = world) {
+  const m = new THREE.Mesh(wedgeGeometry(w, h, l), mat);
+  m.position.set(x, y, z);
+  m.rotation.y = rotY;
+  m.castShadow = m.receiveShadow = true;
+  parent.add(m);
+  return m;
+}
+
+function label(text, x, y, z, scale = 1) {
+  const c = document.createElement('canvas');
+  c.width = 256; c.height = 96;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = 'rgba(25,30,38,0.75)';
+  ctx.beginPath(); ctx.roundRect(8, 12, 240, 72, 18); ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 40px system-ui, sans-serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(text, 128, 50);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthWrite: false }));
+  s.scale.set(2.4 * scale, 0.9 * scale, 1);
+  s.position.set(x, y, z);
+  decor.add(s);
+}
+
+function buildWorld() {
+  const SIZE = 120;
+  // Ground (top surface at y = 0)
+  box(SIZE, 1, SIZE, 0, -1, 0, MAT.floor);
+  // Perimeter walls
+  const H = 4, T = 1, half = SIZE / 2;
+  box(SIZE, H, T, 0, 0, -half, MAT.wall);
+  box(SIZE, H, T, 0, 0, half, MAT.wall);
+  box(T, H, SIZE, -half, 0, 0, MAT.wall);
+  box(T, H, SIZE, half, 0, 0, MAT.wall);
+
+  // --- North: slope test (15° / 30° / 45° / 60°) each leading to a platform
+  const slopes = [15, 30, 45, 60];
+  slopes.forEach((deg, i) => {
+    const x = -12 + i * 8;
+    const h = 3;
+    const l = h / Math.tan(THREE.MathUtils.degToRad(deg));
+    const z0 = -10;
+    ramp(4, h, l, x, 0, z0, 0, deg > CFG.maxSlopeDeg ? MAT.blue : MAT.accent);
+    box(4, h, 4, x, 0, z0 - l - 2);
+    label(`${deg}°`, x, 1.6, z0 + 0.6, 0.8);
+  });
+
+  // --- East: stairs (visual steps + invisible ramp collider) up to a deck
+  {
+    const steps = 12, rise = 0.25, run = 0.4, w = 3;
+    const x = 16, z0 = 2;
+    for (let i = 0; i < steps; i++) {
+      box(w, rise * (i + 1), run, x, 0, z0 - run * i - run / 2, MAT.block, decor);
+    }
+    // Collider: wedge from bottom-front edge to top-back edge
+    const col = ramp(w, rise * steps, run * steps, x, 0, z0, 0, MAT.block);
+    col.visible = false;
+    const topZ = z0 - run * steps;
+    box(8, rise * steps, 8, x, 0, topZ - 4, MAT.wall);
+    label('Stairs', x, 1.2, z0 + 0.8, 0.8);
+
+    // Bridge from the deck heading east
+    box(10, 0.4, 2, x + 9, rise * steps - 0.4, topZ - 4, MAT.accent);
+    box(4, rise * steps, 4, x + 16, 0, topZ - 4, MAT.wall);
+    // Railings (thin, test camera collision)
+    box(10, 0.8, 0.15, x + 9, rise * steps, topZ - 4 - 1, MAT.block);
+  }
+
+  // --- West: step-height test (jump up)
+  [0.3, 0.6, 1.0, 1.4, 1.8].forEach((h, i) => {
+    const z = 6 - i * 3.2;
+    box(3, h, 2.6, -16, 0, z, i % 2 ? MAT.block : MAT.wall);
+    label(`${h} m`, -16, h + 0.9, z, 0.7);
+  });
+
+  // --- West: gap jumps (raised platforms with increasing gaps)
+  {
+    let x = -24;
+    const gaps = [1.5, 2.5, 3.5, 4.5, 5.5];
+    box(3, 1, 3, x, 0, -14, MAT.wall);
+    gaps.forEach((g, i) => {
+      x -= 3 + g;
+      box(3, 1, 3, x, 0, -14, i % 2 ? MAT.wall : MAT.green);
+      label(`${g} m`, x + 1.5 + g / 2, 2.4, -14, 0.65);
+    });
+  }
+
+  // --- South-west: low ceiling tunnel (camera collision test)
+  {
+    const x = -10, z = 22;
+    box(1, 2.6, 14, x - 2.5, 0, z, MAT.wall);
+    box(1, 2.6, 14, x + 2.5, 0, z, MAT.wall);
+    box(6, 0.6, 14, x, 2.6, z, MAT.block);
+    label('Tunnel', x, 4, z - 7.5, 0.8);
+  }
+
+  // --- South: pillar field
+  for (let i = 0; i < 5; i++) {
+    for (let j = 0; j < 4; j++) {
+      const h = 2 + ((i * 7 + j * 3) % 5);
+      box(1, h, 1, 6 + i * 3, 0, 14 + j * 3, (i + j) % 3 === 0 ? MAT.blue : MAT.block);
+    }
+  }
+
+  // --- South-east: stacked parkour tower
+  {
+    const x = 26, z = 20;
+    box(6, 1, 6, x, 0, z, MAT.wall);
+    box(3, 1, 3, x + 4, 1, z - 3, MAT.accent);
+    box(3, 1, 3, x + 1, 2, z - 7, MAT.accent);
+    box(3, 1, 3, x - 3, 3, z - 5, MAT.accent);
+    box(6, 1, 6, x - 3, 4, z + 1, MAT.green);
+    label('Climb', x, 2.2, z + 3.4, 0.8);
+  }
+
+  // --- Long gentle ramp up to a high lookout
+  ramp(5, 6, 26, 36, 0, 10, 0, MAT.accent);
+  box(8, 6, 8, 36, 0, 10 - 26 - 4, MAT.wall);
+
+  // --- Corridor maze bits (walls at various angles)
+  for (let i = 0; i < 4; i++) {
+    const w = box(6, 2.5, 0.5, -34 + i * 2, 0, 16 + i * 5, MAT.wall);
+    w.rotation.y = (i % 2 ? 1 : -1) * 0.5;
+  }
+
+  // Scattered crates
+  [[4, -3, 1], [5.2, -3.4, 0.7], [-4, 4, 1.2], [-3, 5.5, 0.6], [10, 4, 1.5]].forEach(([x, z, s]) =>
+    box(s, s, s, x, 0, z, MAT.block));
+
+  // Spawn pad marker
+  box(3, 0.05, 3, 0, 0, 0, MAT.green);
+}
+buildWorld();
+
+const octree = new Octree();
+octree.fromGraphNode(world);
+
+/* ============================================================
+   PLAYER
+   ============================================================ */
+const SPAWN = new THREE.Vector3(0, 0.1, 0);
+const collider = new Capsule(
+  new THREE.Vector3(0, CFG.radius, 0),
+  new THREE.Vector3(0, CFG.height - CFG.radius, 0),
+  CFG.radius
+);
+const velocity = new THREE.Vector3();
+let grounded = false;
+let groundedTimer = 0;   // time since last grounded (coyote)
+let jumpBufferTimer = 0;
+let facing = 0;
+
+// Greybox mannequin: capsule + visor, wrapped so we can squash/lean
+const player = new THREE.Group();
+const rig = new THREE.Group();
+player.add(rig);
+scene.add(player);
+{
+  const bodyMat = new THREE.MeshStandardMaterial({ color: 0xf2f2f2, roughness: 0.6 });
+  const body = new THREE.Mesh(
+    new THREE.CapsuleGeometry(CFG.radius, CFG.height - CFG.radius * 2, 6, 16), bodyMat);
+  body.position.y = CFG.height / 2;
+  const visor = new THREE.Mesh(
+    new THREE.BoxGeometry(0.42, 0.16, 0.2),
+    new THREE.MeshStandardMaterial({ color: 0x1d2630, roughness: 0.25, metalness: 0.3 }));
+  visor.position.set(0, CFG.height - 0.35, CFG.radius - 0.05);
+  const pack = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.5, 0.18),
+    new THREE.MeshStandardMaterial({ color: 0xe8913a, roughness: 0.7 }));
+  pack.position.set(0, 1.1, -CFG.radius - 0.02);
+  for (const m of [body, visor, pack]) { m.castShadow = true; m.receiveShadow = true; rig.add(m); }
+}
+
+function respawn() {
+  const d = SPAWN.clone().sub(collider.start).add(new THREE.Vector3(0, CFG.radius, 0));
+  collider.translate(d);
+  velocity.set(0, 0, 0);
+}
+respawn();
+
+/* ============================================================
+   INPUT — pointer events handle multi-touch AND mouse
+   ============================================================ */
+const input = { moveX: 0, moveY: 0, jumpHeld: false };
+const look = { yaw: 0, pitch: 0.35 };    // yaw 0 = looking north (-Z)
+
+const touchLayer = document.getElementById('touch');
+const joyBase = document.getElementById('joy-base');
+const joyKnob = document.getElementById('joy-knob');
+const hint = document.getElementById('hint');
+const split = document.getElementById('split');
+
+const joy = { id: null, cx: 0, cy: 0, x: 0, y: 0 };
+const lookPtr = { id: null, lastX: 0, lastY: 0 };
+
+function joyRestPosition() {
+  joy.cx = 100; joy.cy = window.innerHeight - 110;
+  placeJoy(joy.cx, joy.cy);
+}
+function placeJoy(x, y) { joyBase.style.left = x + 'px'; joyBase.style.top = y + 'px'; }
+function setKnob(dx, dy) { joyKnob.style.transform = `translate(${dx}px, ${dy}px)`; }
+
+let hintShown = true;
+function dismissHint() {
+  if (!hintShown) return;
+  hintShown = false;
+  setTimeout(() => { hint.classList.add('hidden'); split.classList.add('hidden'); }, 1200);
+}
+
+touchLayer.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  dismissHint();
+  if (e.clientX < window.innerWidth / 2 && joy.id === null) {
+    joy.id = e.pointerId;
+    joy.cx = e.clientX; joy.cy = e.clientY;
+    placeJoy(joy.cx, joy.cy);
+    joyBase.classList.add('active');
+    setKnob(0, 0);
+  } else if (lookPtr.id === null) {
+    lookPtr.id = e.pointerId;
+    lookPtr.lastX = e.clientX; lookPtr.lastY = e.clientY;
+  }
+  touchLayer.setPointerCapture?.(e.pointerId);
+});
+
+touchLayer.addEventListener('pointermove', (e) => {
+  if (e.pointerId === joy.id) {
+    let dx = e.clientX - joy.cx, dy = e.clientY - joy.cy;
+    const len = Math.hypot(dx, dy);
+    const max = CFG.joyRadius;
+    if (len > max) { dx *= max / len; dy *= max / len; }
+    setKnob(dx, dy);
+    joy.x = dx / max; joy.y = dy / max;
+  } else if (e.pointerId === lookPtr.id) {
+    const dx = e.clientX - lookPtr.lastX, dy = e.clientY - lookPtr.lastY;
+    lookPtr.lastX = e.clientX; lookPtr.lastY = e.clientY;
+    look.yaw -= dx * CFG.lookSensitivity;
+    look.pitch = THREE.MathUtils.clamp(look.pitch + dy * CFG.lookSensitivity, CFG.pitchMin, CFG.pitchMax);
+  }
+});
+
+function endPointer(e) {
+  if (e.pointerId === joy.id) {
+    joy.id = null; joy.x = joy.y = 0;
+    setKnob(0, 0);
+    joyBase.classList.remove('active');
+    joyRestPosition();
+  } else if (e.pointerId === lookPtr.id) {
+    lookPtr.id = null;
+  }
+}
+touchLayer.addEventListener('pointerup', endPointer);
+touchLayer.addEventListener('pointercancel', endPointer);
+touchLayer.addEventListener('lostpointercapture', endPointer);
+
+// Buttons
+function bindButton(el, onDown, onUp) {
+  el.addEventListener('pointerdown', (e) => {
+    e.preventDefault(); e.stopPropagation();
+    el.classList.add('pressed'); dismissHint(); onDown?.();
+  });
+  const up = (e) => { el.classList.remove('pressed'); onUp?.(); };
+  el.addEventListener('pointerup', up);
+  el.addEventListener('pointercancel', up);
+  el.addEventListener('pointerleave', up);
+}
+bindButton(document.getElementById('jump'),
+  () => { input.jumpHeld = true; jumpBufferTimer = CFG.jumpBuffer; },
+  () => { input.jumpHeld = false; });
+bindButton(document.getElementById('reset'), respawn);
+
+const fsBtn = document.getElementById('fs');
+const fsEl = document.documentElement;
+if (!(fsEl.requestFullscreen || fsEl.webkitRequestFullscreen)) fsBtn.style.display = 'none';
+bindButton(fsBtn, () => {
+  if (document.fullscreenElement || document.webkitFullscreenElement) {
+    (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+  } else {
+    (fsEl.requestFullscreen || fsEl.webkitRequestFullscreen).call(fsEl, { navigationUI: 'hide' })
+      ?.catch?.(() => {});
+    screen.orientation?.lock?.('landscape').catch(() => {});
+  }
+});
+
+// Keyboard fallback for desktop testing
+const keys = new Set();
+addEventListener('keydown', (e) => {
+  keys.add(e.code);
+  if (e.code === 'Space' && !e.repeat) { jumpBufferTimer = CFG.jumpBuffer; input.jumpHeld = true; }
+  if (e.code === 'KeyR') respawn();
+});
+addEventListener('keyup', (e) => {
+  keys.delete(e.code);
+  if (e.code === 'Space') input.jumpHeld = false;
+});
+
+// Block pinch-zoom / context menu on mobile browsers
+document.addEventListener('gesturestart', (e) => e.preventDefault());
+document.addEventListener('contextmenu', (e) => e.preventDefault());
+
+function readMoveInput() {
+  let x = joy.x, y = joy.y;
+  const kx = (keys.has('KeyD') || keys.has('ArrowRight') ? 1 : 0) - (keys.has('KeyA') || keys.has('ArrowLeft') ? 1 : 0);
+  const ky = (keys.has('KeyS') || keys.has('ArrowDown') ? 1 : 0) - (keys.has('KeyW') || keys.has('ArrowUp') ? 1 : 0);
+  if (kx || ky) { const l = Math.hypot(kx, ky); x = kx / l; y = ky / l; }
+
+  // Radial deadzone, rescaled so movement starts smoothly from 0
+  const mag = Math.hypot(x, y);
+  if (mag < CFG.joyDeadzone) { input.moveX = input.moveY = 0; return; }
+  const scaled = Math.min(1, (mag - CFG.joyDeadzone) / (1 - CFG.joyDeadzone));
+  input.moveX = (x / mag) * scaled;
+  input.moveY = (y / mag) * scaled;
+}
+
+/* ============================================================
+   PHYSICS — capsule vs octree, slope limit, ground snap
+   ============================================================ */
+const SLOPE_COS = Math.cos(THREE.MathUtils.degToRad(CFG.maxSlopeDeg));
+const _wish = new THREE.Vector3();
+const _fwd = new THREE.Vector3();
+const _right = new THREE.Vector3();
+const _hv = new THREE.Vector3();
+const _tmp = new THREE.Vector3();
+let landImpact = 0;
+
+function resolveCollisions() {
+  const r = octree.capsuleIntersect(collider);
+  if (!r) return;
+  if (r.normal.y > SLOPE_COS) {
+    // Walkable floor: push straight up so we don't slide down slopes
+    grounded = true;
+    collider.translate(_tmp.set(0, r.depth / r.normal.y, 0));
+    if (velocity.y < 0) velocity.y = 0;
+  } else {
+    // Wall / ceiling / too-steep slope: slide along it
+    collider.translate(_tmp.copy(r.normal).multiplyScalar(r.depth));
+    const vn = velocity.dot(r.normal);
+    if (vn < 0) velocity.addScaledVector(r.normal, -vn);
+  }
+}
+
+function updatePlayer(dt) {
+  readMoveInput();
+
+  // Camera-relative wish direction
+  _fwd.set(-Math.sin(look.yaw), 0, -Math.cos(look.yaw));
+  _right.set(Math.cos(look.yaw), 0, -Math.sin(look.yaw));
+  _wish.set(0, 0, 0).addScaledVector(_fwd, -input.moveY).addScaledVector(_right, input.moveX);
+  const wishSpeed = _wish.length() * CFG.maxSpeed;
+  if (_wish.lengthSq() > 0) _wish.normalize();
+
+  // Jump (buffer + coyote time)
+  jumpBufferTimer -= dt;
+  const canJump = grounded || groundedTimer < CFG.coyoteTime;
+  let jumped = false;
+  if (jumpBufferTimer > 0 && canJump && velocity.y <= 0.01) {
+    velocity.y = Math.sqrt(2 * CFG.gravity * CFG.jumpHeight);
+    jumpBufferTimer = 0;
+    groundedTimer = CFG.coyoteTime; // consume coyote
+    grounded = false;
+    jumped = true;
+  }
+  // Variable jump height: release early to cut the jump
+  if (!input.jumpHeld && velocity.y > 0 && !grounded) velocity.y -= CFG.gravity * 1.2 * dt;
+
+  // Horizontal acceleration toward target velocity
+  const accel = grounded ? CFG.groundAccel : CFG.airAccel;
+  _hv.set(velocity.x, 0, velocity.z);
+  _tmp.copy(_wish).multiplyScalar(wishSpeed);
+  _hv.lerp(_tmp, 1 - Math.exp(-accel * dt));
+  velocity.x = _hv.x; velocity.z = _hv.z;
+
+  // Integrate in substeps for stable collisions
+  const wasGrounded = grounded;
+  const fallSpeed = -velocity.y;
+  const sdt = dt / CFG.substeps;
+  grounded = false;
+  for (let i = 0; i < CFG.substeps; i++) {
+    velocity.y -= CFG.gravity * sdt;
+    collider.translate(_tmp.copy(velocity).multiplyScalar(sdt));
+    resolveCollisions();
+  }
+
+  // Ground snap: stick to ramps/stairs when walking down them
+  if (!grounded && wasGrounded && !jumped && velocity.y <= 0) {
+    collider.translate(_tmp.set(0, -CFG.groundSnap, 0));
+    const r = octree.capsuleIntersect(collider);
+    if (r && r.normal.y > SLOPE_COS) {
+      collider.translate(_tmp.set(0, r.depth / r.normal.y, 0));
+      grounded = true;
+      velocity.y = 0;
+    } else {
+      collider.translate(_tmp.set(0, CFG.groundSnap, 0));
+    }
+  }
+
+  if (grounded && !wasGrounded && fallSpeed > 4) landImpact = Math.min(0.25, fallSpeed / 60);
+  groundedTimer = grounded ? 0 : groundedTimer + dt;
+
+  if (collider.start.y < -25) respawn();
+
+  // Face movement direction
+  if (wishSpeed > 0.1) {
+    const target = Math.atan2(_wish.x, _wish.z);
+    let diff = target - facing;
+    diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+    facing += diff * (1 - Math.exp(-CFG.turnSpeed * dt));
+  }
+}
+
+/* ============================================================
+   PROCEDURAL ANIMATION — bob, lean, squash
+   ============================================================ */
+let stride = 0;
+function animatePlayer(dt, t) {
+  player.position.set(collider.start.x, collider.start.y - CFG.radius, collider.start.z);
+  player.rotation.y = facing;
+
+  const speed = Math.hypot(velocity.x, velocity.z);
+  const k = speed / CFG.maxSpeed;
+  stride += speed * dt * 2.2;
+
+  let bob = 0, sy = 1, lean = 0;
+  if (grounded) {
+    bob = Math.abs(Math.sin(stride)) * 0.08 * k;
+    sy = 1 + Math.sin(t * 2.2) * 0.012 * (1 - k);   // idle breathing
+    lean = k * 0.12;
+  } else {
+    sy = 1 + THREE.MathUtils.clamp(velocity.y * 0.012, -0.08, 0.08); // stretch in air
+    lean = k * 0.06;
+  }
+  landImpact *= Math.exp(-10 * dt);
+  sy -= landImpact;
+  const sxz = 1 / Math.sqrt(sy);
+
+  rig.position.y = bob;
+  rig.scale.set(sxz, sy, sxz);
+  rig.rotation.x = THREE.MathUtils.lerp(rig.rotation.x, lean, 1 - Math.exp(-8 * dt));
+}
+
+/* ============================================================
+   CAMERA — orbit with collision (pull in on hit, ease back out)
+   ============================================================ */
+const camTarget = new THREE.Vector3();
+const _desired = new THREE.Vector3();
+const _dir = new THREE.Vector3();
+const _ray = new THREE.Ray();
+let camDist = CFG.camDistance;
+
+function updateCamera(dt, snap = false) {
+  _desired.set(collider.start.x, collider.start.y - CFG.radius + CFG.camHeight, collider.start.z);
+  if (snap) camTarget.copy(_desired);
+  else {
+    const a = 1 - Math.exp(-CFG.camFollow * dt);
+    const ay = 1 - Math.exp(-CFG.camFollow * 0.6 * dt); // softer vertical follow
+    camTarget.x += (_desired.x - camTarget.x) * a;
+    camTarget.z += (_desired.z - camTarget.z) * a;
+    camTarget.y += (_desired.y - camTarget.y) * ay;
+  }
+
+  const cp = Math.cos(look.pitch);
+  _dir.set(Math.sin(look.yaw) * cp, Math.sin(look.pitch), Math.cos(look.yaw) * cp);
+
+  let want = CFG.camDistance;
+  _ray.set(camTarget, _dir);
+  const hit = octree.rayIntersect(_ray);
+  const pad = 0.25;
+  if (hit && hit.distance < CFG.camDistance + pad) want = Math.max(CFG.camMinDistance, hit.distance - pad);
+
+  if (want < camDist || snap) camDist = want;                  // pull in instantly
+  else camDist += (want - camDist) * (1 - Math.exp(-4 * dt));   // ease back out
+
+  camera.position.copy(camTarget).addScaledVector(_dir, camDist);
+  camera.lookAt(camTarget);
+
+  // Fade the character when the camera is very close
+  const close = camDist < 1.3;
+  rig.visible = !close;
+
+  // Keep shadow frustum centred on the player
+  sun.position.copy(camTarget).add(SUN_OFFSET);
+  sun.target.position.copy(camTarget);
+}
+
+/* ============================================================
+   LOOP
+   ============================================================ */
+const hud = document.getElementById('hud');
+const clock = new THREE.Clock();
+let fpsFrames = 0, fpsTime = 0, fps = 0;
+
+joyRestPosition();
+updateCamera(0, true);
+
+function frame() {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const t = clock.elapsedTime;
+
+  updatePlayer(dt);
+  animatePlayer(dt, t);
+  updateCamera(dt);
+  renderer.render(scene, camera);
+
+  fpsFrames++; fpsTime += dt;
+  if (fpsTime >= 0.5) {
+    fps = Math.round(fpsFrames / fpsTime); fpsFrames = 0; fpsTime = 0;
+    const sp = Math.hypot(velocity.x, velocity.z).toFixed(1);
+    hud.textContent = `${fps} fps · ${sp} m/s · ${grounded ? 'grounded' : 'air'}`;
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// Handy for debugging from the console
+window.game = { scene, camera, collider, velocity, look, input, respawn, get grounded() { return grounded; } };
+
+addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  if (joy.id === null) joyRestPosition();
+});
+</script>
+</body>
+</html>
